@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `CompactionRequiredError(reason=...)`: an `LLMClient` raises it when a request was
+  rejected for a limit compaction can fix, too many images (`"image_count"`) or too many
+  request bytes (`"request_size"`). The agent drops the latest turn, summarizes the rest
+  and retries the step once.
+- `SummaryMessage.trigger`: why the agent summarized, `"token_threshold"` when usage
+  crossed the summarization cutoff, otherwise the `CompactionRequiredError` reason.
+  Histories saved without it load as `"token_threshold"`, the only trigger before this
+  release.
+
 ## v0.2.0 (unreleased)
 
 Assistant messages are now block-based (SP-001): an assistant turn is an ordered

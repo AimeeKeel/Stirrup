@@ -16,10 +16,11 @@ from stirrup.core.cache import (
     CacheState,
     deserialize_messages,
 )
-from stirrup.core.exceptions import ContextOverflowError, OutputTokenLimitError
+from stirrup.core.exceptions import CompactionRequiredError, ContextOverflowError, OutputTokenLimitError
 from stirrup.core.models import (
     AssistantMessage,
     ChatMessage,
+    EmptyParams,
     ImageContentBlock,
     LLMClient,
     ReasoningBlock,
@@ -37,6 +38,7 @@ from stirrup.core.models import (
     UserMessage,
     joined_text,
 )
+from stirrup.prompts import MESSAGE_SUMMARIZER
 from stirrup.tools import default_tools
 from stirrup.tools.finish import SIMPLE_FINISH_TOOL, FinishParams
 
@@ -711,7 +713,7 @@ def test_v01_uncorrelatable_tool_result_raises(history: list[dict[str, object]])
 async def test_cache_state_preserves_special_user_message_types() -> None:
     state = CacheState(
         msgs=[
-            SummaryMessage(content="Summary", replaced_ids=["turn-1", "turn-2"]),
+            SummaryMessage(content="Summary", replaced_ids=["turn-1", "turn-2"], trigger="image_count"),
             TurnWarningMessage(content="One turn left"),
             UserMessage(content="Regular user message"),
         ],
@@ -724,6 +726,7 @@ async def test_cache_state_preserves_special_user_message_types() -> None:
 
     assert isinstance(restored.msgs[0], SummaryMessage)
     assert restored.msgs[0].replaced_ids == ["turn-1", "turn-2"]
+    assert restored.msgs[0].trigger == "image_count"
     assert isinstance(restored.msgs[1], TurnWarningMessage)
     assert type(restored.msgs[2]) is UserMessage
 
@@ -1643,6 +1646,7 @@ async def test_summarize_history_has_one_summary_per_trajectory() -> None:
 
     # The summary content should be different between history[1] and history[2]
     assert summaries_1[0].content != summaries_2[0].content
+    assert summaries_1[0].trigger == summaries_2[0].trigger == "token_threshold"
 
 
 async def test_summarization_context_overflow_unwinds_and_retries() -> None:
@@ -1783,6 +1787,136 @@ async def test_summarizer_tool_call_only_exhausts_retries_and_raises() -> None:
     with pytest.raises(RuntimeError, match="no text blocks"):
         async with agent.session() as session:
             await session.run([SystemMessage(content="System prompt"), UserMessage(content="Do the task")])
+
+
+def _text_response(text: str, *, input_tokens: int = 100) -> AssistantMessage:
+    return AssistantMessage(blocks=[TextBlock(text=text)], token_usage=TokenUsage(input=input_tokens, answer=50))
+
+
+def _finish_response() -> AssistantMessage:
+    return AssistantMessage(
+        blocks=[
+            ToolCall(
+                name=DEFAULT_FINISH_TOOL_NAME,
+                arguments='{"reason": "Completed", "paths": []}',
+                tool_call_id="call_finish",
+            ),
+        ],
+        token_usage=TokenUsage(input=100, answer=50),
+    )
+
+
+def _image_task() -> list[ChatMessage]:
+    return [SystemMessage(content="System prompt"), UserMessage(content=["Do the task", _sample_png_block()])]
+
+
+class ImageLimitClient(LLMClient):
+    """Rejects any request carrying more than ``limit`` images; otherwise screenshots until done."""
+
+    def __init__(self, *, limit: int, screenshots: int) -> None:
+        self.limit = limit
+        self.screenshots = screenshots
+        self.taken = 0
+        self.rejected = 0
+        self.summary_image_counts: list[int] = []
+
+    @property
+    def model_slug(self) -> str:
+        return "image-limit-model"
+
+    @property
+    def context_window_tokens(self) -> int:
+        return 1_000_000
+
+    async def generate(self, messages: list[ChatMessage], tools: dict[str, Tool]) -> AssistantMessage:  # noqa: ARG002
+        images = _image_count(messages)
+        if images > self.limit:
+            self.rejected += 1
+            raise CompactionRequiredError(
+                f"request contains {images} images, exceeding the maximum of {self.limit}", reason="image_count"
+            )
+        last = messages[-1]
+        if (
+            isinstance(last, UserMessage)
+            and isinstance(last.content, str)
+            and last.content.startswith(MESSAGE_SUMMARIZER)
+        ):
+            self.summary_image_counts.append(images)
+            return _text_response("Took screenshots of the page.")
+        if self.taken < self.screenshots:
+            self.taken += 1
+            return AssistantMessage(
+                blocks=[ToolCall(name="screenshot", arguments="{}", tool_call_id=f"call_{self.taken}")],
+                token_usage=TokenUsage(input=100, answer=50),
+            )
+        return _finish_response()
+
+
+def _image_count(messages: list[ChatMessage]) -> int:
+    return sum(
+        isinstance(block, ImageContentBlock)
+        for msg in messages
+        if isinstance(msg, UserMessage | ToolMessage) and isinstance(msg.content, list)
+        for block in msg.content
+    )
+
+
+def _screenshot_tool() -> Tool[EmptyParams, None]:
+    return Tool[EmptyParams, None](
+        name="screenshot",
+        description="Take a screenshot",
+        parameters=EmptyParams,
+        executor=lambda _params: ToolResult(content=["screenshot", _sample_png_block()]),
+    )
+
+
+async def test_image_limit_rejections_compact_and_the_run_finishes() -> None:
+    client = ImageLimitClient(limit=3, screenshots=6)
+    agent = Agent(
+        client=client, name="test-agent", max_turns=30, tools=[_screenshot_tool()], finish_tool=SIMPLE_FINISH_TOOL
+    )
+
+    async with agent.session() as session:
+        finish_params, history, _ = await session.run(_image_task())
+
+    assert finish_params is not None
+    assert client.rejected > 0
+    # Each summary was written from accepted history, with its images.
+    assert client.summary_image_counts
+    assert all(0 < count <= client.limit for count in client.summary_image_counts)
+    assert len(history) == len(client.summary_image_counts) + 1
+    triggers = [msg.trigger for messages in history for msg in messages if isinstance(msg, SummaryMessage)]
+    assert triggers == ["image_count"] * len(client.summary_image_counts)
+
+
+async def test_compaction_required_with_no_turn_to_drop_propagates_the_original_error() -> None:
+    client = MockLLMClient(
+        [_text_response("First step"), CompactionRequiredError("too many images", reason="image_count")]
+    )
+    agent = Agent(client=client, name="test-agent", max_turns=5, tools=[], finish_tool=SIMPLE_FINISH_TOOL)
+
+    with pytest.raises(CompactionRequiredError, match="too many images"):
+        async with agent.session() as session:
+            await session.run(_image_task())
+
+    assert client.call_count == 2
+
+
+async def test_compaction_required_after_compacting_propagates() -> None:
+    client = MockLLMClient(
+        [
+            _text_response("First step"),
+            _text_response("Second step"),
+            CompactionRequiredError("request too large", reason="request_size"),
+            _text_response("Summary of the work so far."),
+            CompactionRequiredError("still too large", reason="request_size"),
+        ]
+    )
+    agent = Agent(client=client, name="test-agent", max_turns=5, tools=[], finish_tool=SIMPLE_FINISH_TOOL)
+
+    with pytest.raises(CompactionRequiredError, match="still too large"):
+        async with agent.session() as session:
+            await session.run(_image_task())
 
 
 async def test_shared_subagent_normalizes_absolute_local_output_and_rejects_directory() -> None:
